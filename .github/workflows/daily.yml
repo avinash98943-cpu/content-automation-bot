@@ -1,0 +1,29 @@
+name: Daily Content Bot
+
+on:
+  schedule:
+    # This runs at 8:30 PM IST (which is 15:00 UTC) every day
+    - cron: '0 15 * * *'
+  workflow_dispatch: # This allows you to click a button to run it MANUALLY
+
+jobs:
+  run_bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+        
+      - name: Run Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+        run: python main.py
