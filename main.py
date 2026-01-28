@@ -5,6 +5,8 @@ import json
 import tempfile
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from google import genai
+from google.genai import types
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -12,79 +14,8 @@ SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"] 
 
-# --- HELPER: RAW GEMINI API (Bypasses Broken Library) ---
-def gemini_upload_file(file_path, mime_type="audio/mp3"):
-    """Uploads file using raw REST API to avoid library issues."""
-    file_size = os.path.getsize(file_path)
-    url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={GEMINI_API_KEY}"
-    
-    # 1. Start Upload
-    headers = {
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": str(file_size),
-        "X-Goog-Upload-Header-Content-Type": mime_type,
-        "Content-Type": "application/json"
-    }
-    data = {"file": {"display_name": "audio_call"}}
-    response = requests.post(url, headers=headers, json=data)
-    upload_url = response.headers.get("X-Goog-Upload-URL")
-    
-    # 2. Upload Bytes
-    with open(file_path, "rb") as f:
-        headers = {
-            "Content-Length": str(file_size),
-            "X-Goog-Upload-Offset": "0",
-            "X-Goog-Upload-Command": "upload, finalize"
-        }
-        response = requests.post(upload_url, headers=headers, data=f)
-    
-    file_info = response.json()
-    file_uri = file_info['file']['uri']
-    
-    # 3. Wait for Processing
-    print("Waiting for audio processing...")
-    while True:
-        check_url = f"https://generativelanguage.googleapis.com/v1beta/files/{file_info['file']['name']}?key={GEMINI_API_KEY}"
-        state_resp = requests.get(check_url).json()
-        state = state_resp.get("state")
-        if state == "ACTIVE":
-            break
-        if state == "FAILED":
-            raise Exception("File processing failed")
-        time.sleep(2)
-        
-    return file_uri
-
-def gemini_generate(prompt, file_uri=None):
-    """Generates content using raw REST API."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    contents = []
-    parts = []
-    
-    if file_uri:
-        parts.append({"file_data": {"mime_type": "audio/mp3", "file_uri": file_uri}})
-    
-    parts.append({"text": prompt})
-    contents.append({"parts": parts})
-    
-    payload = {"contents": contents}
-    
-    response = requests.post(url, json=payload)
-    
-    if response.status_code != 200:
-        print(f"API Error: {response.text}")
-        return None
-        
-    try:
-        text = response.json()['candidates'][0]['content']['parts'][0]['text']
-        # Clean JSON
-        clean_text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
-    except Exception as e:
-        print(f"Parsing Error: {e}")
-        return None
+# Initialize the NEW Google GenAI Client
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- GOOGLE SHEETS SETUP ---
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
@@ -92,6 +23,13 @@ creds = service_account.Credentials.from_service_account_info(
     creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets']
 )
 service = build('sheets', 'v4', credentials=creds)
+
+def send_slack_msg(blocks):
+    """Helper to send valid Slack messages."""
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks})
+    except Exception as e:
+        print(f"Slack Error: {e}")
 
 def get_settings():
     try:
@@ -112,6 +50,7 @@ def get_pending_calls():
     for i, row in enumerate(rows):
         if len(row) > 3 and row[3] == "Pending":
             try:
+                # Default to 600s if duration missing, to ensure we process it
                 duration = float(row[2]) if len(row) > 2 else 600
                 if duration > 300:
                     pending.append({"row": i + 1, "url": row[1]})
@@ -119,8 +58,23 @@ def get_pending_calls():
                 pass 
     return pending
 
+def clean_json_text(text):
+    """Cleans AI response to ensure valid JSON."""
+    text = text.replace("```json", "").replace("```", "").strip()
+    # Sometimes AI adds a preamble, find the first '{' and last '}'
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end != -1:
+        return text[start:end]
+    return text
+
 def main():
-    print("--- Starting Bot (Raw Mode) ---")
+    print("--- Starting Bot (New GenAI SDK) ---")
+    
+    # 0. Test Slack Connection First
+    print("Testing Slack connection...")
+    send_slack_msg([{"type": "section", "text": {"type": "mrkdwn", "text": "🤖 *Bot Started Processing...*"}}])
+
     target_posts = get_settings()
     calls = get_pending_calls()
     print(f"Found {len(calls)} pending calls.")
@@ -132,28 +86,51 @@ def main():
             break
             
         print(f"Processing Row {call['row']}...")
-        
-        # 1. Download Audio
-        resp = requests.get(call['url'])
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(resp.content)
-            tmp_path = tmp.name
+        tmp_path = None
 
         try:
-            # 2. Upload (Raw API)
-            file_uri = gemini_upload_file(tmp_path)
+            # 1. Download Audio
+            resp = requests.get(call['url'])
+            if resp.status_code != 200:
+                print("Failed to download audio.")
+                continue
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                tmp.write(resp.content)
+                tmp_path = tmp.name
+
+            # 2. Upload using New SDK (Handles large files automatically)
+            print("Uploading to Gemini...")
+            file_ref = client.files.upload(path=tmp_path)
             
-            # 3. Analyze
+            # Wait for processing
+            while file_ref.state.name == "PROCESSING":
+                print("Waiting for audio processing...")
+                time.sleep(2)
+                file_ref = client.files.get(name=file_ref.name)
+            
+            if file_ref.state.name == "FAILED":
+                print("Audio processing failed.")
+                continue
+
+            # 3. Analyze Call
+            print("Analyzing...")
             prompt_analysis = """
             I am an Insurance Analyst. Listen to this Tamil sales call.
             Task 1: Transcribe the key conversation points (Summary Transcript) in English.
             Task 2: Identify the specific customer pain point.
             Task 3: Score this call (0-10) on 'Viral Marketing Potential'.
+            
             Return JSON ONLY: {"transcript_summary": "...", "pain_point": "...", "score": 8}
             """
-            analysis = gemini_generate(prompt_analysis, file_uri)
             
-            if not analysis: continue
+            # Use Flash for analysis
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=[file_ref, prompt_analysis]
+            )
+            
+            analysis = json.loads(clean_json_text(response.text))
 
             # 4. Save to Sheet
             service.spreadsheets().values().update(
@@ -163,16 +140,29 @@ def main():
                 body={"values": [["Processed", analysis.get('score', 0), analysis.get('transcript_summary', '')]]}
             ).execute()
 
-            # 5. Generate Post (if good score)
+            # 5. Generate Post (If Score >= 6)
             if analysis.get('score', 0) >= 6:
+                print("Generating Content...")
                 prompt_post = f"""
                 Context: {analysis['pain_point']}
                 Transcript: {analysis['transcript_summary']}
+                
                 Create a Social Media Carousel (3 Slides) in ENGLISH and TAMIL.
                 Also generate 3 different catchy Hooks.
-                Return JSON ONLY: {{"hooks": [], "english_slides": [], "tamil_slides": []}}
+                
+                Return JSON ONLY: 
+                {{
+                    "hooks": ["Hook1", "Hook2", "Hook3"], 
+                    "english_slides": ["Slide1", "Slide2", "Slide3"], 
+                    "tamil_slides": ["Slide1", "Slide2", "Slide3"]
+                }}
                 """
-                content = gemini_generate(prompt_post)
+                
+                post_resp = client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=[prompt_post]
+                )
+                content = json.loads(clean_json_text(post_resp.text))
                 
                 if content:
                     # Send to Slack
@@ -180,18 +170,24 @@ def main():
                         {"type": "header", "text": {"type": "plain_text", "text": "🚀 Viral Content Generated"}},
                         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Issue:* {analysis['pain_point']}\n*Score:* {analysis['score']}"}},
                         {"type": "divider"},
-                        {"type": "section", "text": {"type": "mrkdwn", "text": f"*🇬🇧 English:*\n" + "\n".join(content.get('english_slides', [])) }},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": f"*🎣 Hooks:*\n• " + "\n• ".join(content.get('hooks', [])) }},
                         {"type": "divider"},
-                        {"type": "section", "text": {"type": "mrkdwn", "text": f"*🇮🇳 Tamil:*\n" + "\n".join(content.get('tamil_slides', [])) }}
+                        {"type": "section", "text": {"type": "mrkdwn", "text": f"*🇬🇧 English Slides:*\n" + "\n".join(content.get('english_slides', [])) }},
+                        {"type": "divider"},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": f"*🇮🇳 Tamil Slides:*\n" + "\n".join(content.get('tamil_slides', [])) }}
                     ]
-                    requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks})
+                    send_slack_msg(blocks)
                     print("Sent to Slack!")
                     processed_count += 1
-                    
+            
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error processing row {call['row']}: {e}")
+            # Try to report error to Slack for visibility
+            send_slack_msg([{"type": "section", "text": {"type": "mrkdwn", "text": f"⚠️ Error processing Row {call['row']}: {str(e)}"}}])
+            
         finally:
-            os.remove(tmp_path)
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 if __name__ == "__main__":
     main()
