@@ -1,5 +1,4 @@
-google-generativeai
-google-api-python-client
-google-auth
 requests
+google-auth
+google-api-python-client
 pytz
