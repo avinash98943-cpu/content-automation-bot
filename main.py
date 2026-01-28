@@ -99,9 +99,9 @@ def main():
                 tmp.write(resp.content)
                 tmp_path = tmp.name
 
-            # 2. Upload using New SDK (Handles large files automatically)
+            # 2. Upload using New SDK (FIXED: uses file= instead of path=)
             print("Uploading to Gemini...")
-            file_ref = client.files.upload(path=tmp_path)
+            file_ref = client.files.upload(file=tmp_path)
             
             # Wait for processing
             while file_ref.state.name == "PROCESSING":
@@ -182,7 +182,6 @@ def main():
             
         except Exception as e:
             print(f"Error processing row {call['row']}: {e}")
-            # Try to report error to Slack for visibility
             send_slack_msg([{"type": "section", "text": {"type": "mrkdwn", "text": f"⚠️ Error processing Row {call['row']}: {str(e)}"}}])
             
         finally:
