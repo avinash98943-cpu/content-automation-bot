@@ -13,7 +13,6 @@ import pytz
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-# We will write the credentials.json content into an ENV variable for GitHub
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"] 
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -27,13 +26,16 @@ service = build('sheets', 'v4', credentials=creds)
 
 def get_settings():
     """Reads the 'Settings' tab."""
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range="Settings!B1:B2"
-    ).execute()
-    rows = result.get('values', [])
-    num_posts = int(rows[0][0]) if rows else 2
-    # run_hour = int(rows[1][0]) if len(rows) > 1 else 20
-    return num_posts
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Settings!B1:B2"
+        ).execute()
+        rows = result.get('values', [])
+        num_posts = int(rows[0][0]) if rows else 2
+        return num_posts
+    except Exception as e:
+        print(f"Error reading settings (using default 2): {e}")
+        return 2
 
 def get_pending_calls():
     result = service.spreadsheets().values().get(
@@ -46,7 +48,9 @@ def get_pending_calls():
         if len(row) > 3 and row[3] == "Pending":
             # Check duration > 300s (5 mins)
             try:
-                if float(row[2]) > 300:
+                # If duration is missing or just a check, assume valid
+                duration = float(row[2]) if len(row) > 2 else 600
+                if duration > 300:
                     pending.append({"row": i + 1, "url": row[1]})
             except:
                 pass 
@@ -62,10 +66,18 @@ def process_call_with_gemini(audio_url):
 
     try:
         # 2. Upload to Gemini
+        print("Uploading to Gemini...")
         myfile = genai.upload_file(tmp_path)
         
-        # 3. TRANSCRIPTION & SCORING (Flash Model)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # Wait for file processing (important for large files)
+        while myfile.state.name == "PROCESSING":
+            print("Processing audio...")
+            time.sleep(2)
+            myfile = genai.get_file(myfile.name)
+
+        # 3. TRANSCRIPTION & SCORING (Updated Model Name)
+        print("Analyzing with Gemini Flash...")
+        model = genai.GenerativeModel("gemini-1.5-flash-001")
         
         prompt_analysis = """
         I am an Insurance Analyst. Listen to this Tamil sales call.
@@ -75,7 +87,7 @@ def process_call_with_gemini(audio_url):
         Task 3: Score this call (0-10) on 'Viral Marketing Potential'. 
                 (High score = unique objection, emotional story, or massive misconception).
         
-        Return JSON:
+        Return JSON ONLY:
         {
             "transcript_summary": "...",
             "pain_point": "...",
@@ -84,21 +96,23 @@ def process_call_with_gemini(audio_url):
         }
         """
         res = model.generate_content([myfile, prompt_analysis])
-        analysis = json.loads(res.text.replace("```json", "").replace("```", ""))
         
-        # 4. CONTENT GENERATION (Pro Model - Better Writing)
-        # Only run this if score is decent (>6) to save time, but we will run for top N later.
-        # For now, just return analysis to rank them.
+        # Clean response
+        text = res.text.replace("```json", "").replace("```", "").strip()
+        analysis = json.loads(text)
+        
         return analysis
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error during analysis: {e}")
         return {"score": 0, "transcript_summary": "Error", "pain_point": "Error"}
     finally:
-        os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 def generate_viral_posts(transcript, pain_point):
-    model = genai.GenerativeModel("gemini-1.5-pro")
+    # Updated Model Name
+    model = genai.GenerativeModel("gemini-1.5-pro-001")
     
     prompt_content = f"""
     Context: A customer had this issue: "{pain_point}".
@@ -107,7 +121,7 @@ def generate_viral_posts(transcript, pain_point):
     Create a Social Media Carousel (3 Slides) in ENGLISH and TAMIL.
     Also generate 3 different catchy Hooks.
     
-    Output Format (JSON):
+    Output Format (JSON ONLY):
     {{
         "hooks": ["Hook 1", "Hook 2", "Hook 3"],
         "english_slides": [
@@ -122,13 +136,17 @@ def generate_viral_posts(transcript, pain_point):
         ]
     }}
     """
-    res = model.generate_content(prompt_content)
     try:
-        return json.loads(res.text.replace("```json", "").replace("```", ""))
-    except:
+        res = model.generate_content(prompt_content)
+        text = res.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"Error generating post: {e}")
         return None
 
 def main():
+    print("Starting Bot...")
+    
     # 1. Read Settings
     target_posts = get_settings()
     print(f"Targeting {target_posts} posts for today.")
@@ -144,6 +162,7 @@ def main():
         data = process_call_with_gemini(call['url'])
         
         # Save Transcript to Sheet immediately
+        print(f"Saving transcript for Row {call['row']}...")
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"Calls!D{call['row']}:F{call['row']}",
@@ -156,30 +175,32 @@ def main():
         time.sleep(2)
 
     # 4. Pick Winners
-    analyzed_calls.sort(key=lambda x: x['score'], reverse=True)
+    analyzed_calls.sort(key=lambda x: x.get('score', 0), reverse=True)
     winners = analyzed_calls[:target_posts]
 
     # 5. Generate Final Content for Winners
     for winner in winners:
-        print(f"Generating content for Top Call (Score: {winner['score']})")
-        content = generate_viral_posts(winner['transcript_summary'], winner['pain_point'])
-        
-        if content:
-            # Send to Slack
-            blocks = [
-                {"type": "header", "text": {"type": "plain_text", "text": "🚀 Daily Viral Content Ready"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Source Issue:* {winner['pain_point']}\n*Score:* {winner['score']}/10"}},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*🎣 Choose a Hook:*\n1. " + "\n2. ".join(content['hooks']) }},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*🇬🇧 English Slides:*\n" + "\n---\n".join(content['english_slides']) }},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*🇮🇳 Tamil Slides:*\n" + "\n---\n".join(content['tamil_slides']) }},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*📝 Transcript Preview:*\n{winner['transcript_summary'][:200]}..."}}
-            ]
+        if winner.get('score', 0) > 0:
+            print(f"Generating content for Top Call (Score: {winner['score']})")
+            content = generate_viral_posts(winner['transcript_summary'], winner['pain_point'])
             
-            requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks})
+            if content:
+                # Send to Slack
+                blocks = [
+                    {"type": "header", "text": {"type": "plain_text", "text": "🚀 Daily Viral Content Ready"}},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Source Issue:* {winner['pain_point']}\n*Score:* {winner['score']}/10"}},
+                    {"type": "divider"},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "*🎣 Choose a Hook:*\n1. " + "\n2. ".join(content['hooks']) }},
+                    {"type": "divider"},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "*🇬🇧 English Slides:*\n" + "\n---\n".join(content['english_slides']) }},
+                    {"type": "divider"},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "*🇮🇳 Tamil Slides:*\n" + "\n---\n".join(content['tamil_slides']) }},
+                    {"type": "divider"},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": f"*📝 Transcript Preview:*\n{winner['transcript_summary'][:200]}..."}}
+                ]
+                
+                requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks})
+                print("Sent to Slack!")
 
 if __name__ == "__main__":
     main()
